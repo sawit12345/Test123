@@ -1,0 +1,585 @@
+# =============================================================================
+# VS Code (code-server) — release-snapshot persistence + trycloudflare
+# =============================================================================
+# Drop into .github/workflows/vscode.yml. Trigger manually.
+#
+# PERSISTENCE STRATEGY
+# --------------------
+# The entire /home/runner is tarred + zstd'd at the end of each run,
+# split into 1900 MB chunks (GitHub Release assets cap at 2 GB per file),
+# and uploaded as a versioned GitHub Release tagged `vscode-snapshot/...`.
+# The previous snapshot release is deleted first, so we keep exactly one
+# snapshot in the releases list (history can be kept by tweaking the
+# `gh release delete` line — see comment below).
+#
+# On the next run:
+#   1. Find the most recent vscode-snapshot/* release
+#   2. Download all `home.part.*` assets
+#   3. `cat` them back into the original archive
+#   4. `tar -x` straight into /home/runner
+# If no release exists (first run, manually deleted, or evicted), the
+# restore step is skipped and the workflow just installs fresh state.
+#
+# WHY RELEASES, NOT CACHE
+#   • Cache evicts after 7 days of inactivity; releases don't
+#   • Releases are versioned — easy rollback by re-running with a pinned tag
+#   • No 10 GB per-repo cap to fight
+#   • Cost: extra 1–3 min per run for download + upload of a few GB
+#
+# Permissions required: `contents: write` (to create releases).
+# Storage: 1 release × whatever your home dir compresses to. Free plan
+# has 500 MB of release storage; Pro has 2 GB; Enterprise has 100 GB.
+# If the home tarball is too big, either exclude paths before tar, or
+# upgrade the storage plan.
+# =============================================================================
+
+name: "VS Code (code-server) — release-snapshot + trycloudflare"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long to keep VS Code alive (minutes, max 360)"
+        required: true
+        type: choice
+        default: "120"
+        options: ["30", "60", "120", "180", "240", "300", "360"]
+      password:
+        description: "Optional web UI password (blank = no auth)"
+        required: false
+        type: string
+        default: ""
+      keep_history:
+        description: "Keep old snapshot releases (0 = always overwrite)"
+        required: false
+        type: string
+        default: "0"
+
+concurrency:
+  group: vscode-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write     # for gh release create/delete
+  actions: read
+
+env:
+  CODE_SERVER_VERSION: "4.105.1"
+  CODE_SERVER_PORT: "8080"
+  HOME: /home/runner
+  XDG_CONFIG_HOME: /home/runner/.config
+  XDG_DATA_HOME: /home/runner/.local/share
+  XDG_CACHE_HOME: /home/runner/.cache
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  vscode:
+    name: VS Code Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Source
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 2. cloudflared binary
+      # ------------------------------------------------------------------
+      - name: Install cloudflared
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  CFL=cloudflared-linux-amd64 ;;
+            aarch64) CFL=cloudflared-linux-arm64 ;;
+            *) echo "unsupported arch: $(uname -m)"; exit 1 ;;
+          esac
+          sudo curl -fsSL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/${CFL}"
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared -v
+
+      # ------------------------------------------------------------------
+      # 3. code-server (idempotent)
+      # ------------------------------------------------------------------
+      - name: Install code-server
+        run: |
+          set -euo pipefail
+          if ! command -v code-server >/dev/null 2>&1; then
+            curl -fsSL "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-amd64.tar.gz" \
+              | sudo tar -xz -C /opt
+            sudo mv "/opt/code-server-${{ env.CODE_SERVER_VERSION }}-linux-amd64" /opt/code-server
+            sudo ln -sf /opt/code-server/bin/code-server /usr/local/bin/code-server
+          fi
+          code-server --version
+
+      # ------------------------------------------------------------------
+      # 4. Manifests
+      # ------------------------------------------------------------------
+      - name: Write install manifests
+        run: |
+          mkdir -p .vscode-state
+          cat > .vscode-state/extensions.txt <<'EOF'
+          # Core
+          ms-python.python
+          ms-python.vscode-pylance
+          ms-toolsai.jupyter
+          # Web
+          dbaeumer.vscode-eslint
+          esbenp.prettier-vscode
+          bradlc.vscode-tailwindcss
+          # Look & feel
+          catppuccin.catppuccin-vsc
+          pkief.material-icon-theme
+          usernamehw.errorlens
+          # Git
+          eamodio.gitlens
+          mhutchie.git-graph
+          # Config langs
+          redhat.vscode-yaml
+          tamasfe.even-better-toml
+          EOF
+          cat > .vscode-state/packages.txt <<'EOF'
+          git
+          git-lfs
+          jq
+          tmux
+          htop
+          ripgrep
+          fd-find
+          fzf
+          tree
+          python3-pip
+          pipx
+          unzip
+          fonts-firacode
+          libnss3
+          libasound2t64
+          EOF
+          cat > .vscode-state/pipx.txt <<'EOF'
+          ruff
+          black
+          mypy
+          EOF
+          cat > .vscode-state/npm.txt <<'EOF'
+          typescript
+          @anthropic-ai/claude-code
+          @openai/codex
+          EOF
+
+      - name: Hash manifests
+        id: hash
+        run: |
+          H="${{ hashFiles('.vscode-state/extensions.txt', '.vscode-state/packages.txt', '.vscode-state/pipx.txt', '.vscode-state/npm.txt') }}"
+          echo "manifest=$H" >> "$GITHUB_OUTPUT"
+          echo "manifest hash: $H"
+
+      # ------------------------------------------------------------------
+      # 5. RESTORE: find the latest snapshot release, download parts,
+      #    recombine, untar into /home/runner.
+      # ------------------------------------------------------------------
+      - name: Find latest snapshot release
+        id: latest
+        run: |
+          set -euo pipefail
+          TAG=$(gh release list --repo "$GH_REPO" --limit 100 \
+                --json tagName,createdAt \
+                -q '.[] | select(.tagName | startswith("vscode-snapshot/")) | .tagName' \
+                | head -n1 || true)
+          if [ -n "$TAG" ]; then
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "Latest snapshot: $TAG"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "No prior snapshot found (first run or manually deleted)"
+          fi
+
+      - name: Download + recombine + extract snapshot
+        if: steps.latest.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          rm -rf /tmp/home-parts /tmp/home.tar.zst
+          mkdir -p /tmp/home-parts
+          echo "Downloading assets of $TAG ..."
+          gh release download "$TAG" --repo "$GH_REPO" \
+            --dir /tmp/home-parts --pattern 'home.part.*'
+          echo "Recombining parts..."
+          cat /tmp/home-parts/home.part.* > /tmp/home.tar.zst
+          rm -rf /tmp/home-parts
+          echo "Extracting to /home/runner ..."
+          # --no-same-owner so the runner user owns the files even if the
+          # archive was created by a different user.
+          tar --no-same-owner --use-compress-program=unzstd \
+              -xf /tmp/home.tar.zst -C /home/runner
+          rm -f /tmp/home.tar.zst
+          # Safety net in case tar still wrote root-owned files
+          sudo chown -R runner:runner /home/runner || true
+          echo "Restored from $TAG"
+
+      # ------------------------------------------------------------------
+      # 6. Sentinel check — skip installs if everything matches.
+      # ------------------------------------------------------------------
+      - name: Check install sentinel
+        id: check
+        run: |
+          SENTINEL="/home/runner/.vscode-state/sentinel"
+          EXPECTED="${{ steps.hash.outputs.manifest }}"
+          if [ -f "$SENTINEL" ] && [ "$(cat "$SENTINEL")" = "$EXPECTED" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Sentinel matches; skipping installs"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Sentinel stale; installs will run"
+          fi
+
+      # ------------------------------------------------------------------
+      # 7–10. Install steps (all idempotent, all gated by sentinel).
+      # ------------------------------------------------------------------
+      - name: Install apt packages
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive xargs -a .vscode-state/packages.txt \
+            apt-get install -y --no-install-recommends
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install pipx apps
+        if: steps.check.outputs.skip != 'true'
+        env:
+          PIPX_HOME: /home/runner/.local/share/pipx
+          PIPX_BIN_DIR: /home/runner/.local/bin
+        run: |
+          set -euo pipefail
+          mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
+          pipx ensurepath || true
+          while IFS= read -r app; do
+            [ -z "$app" ] && continue
+            case "$app" in '#'*) continue ;; esac
+            pipx install "$app" || pipx upgrade "$app" || true
+          done < .vscode-state/pipx.txt
+
+      - name: Install npm globals
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NPM_CONFIG_PREFIX: /home/runner/.npm-global
+        run: |
+          set -euo pipefail
+          mkdir -p "$NPM_CONFIG_PREFIX/bin"
+          echo 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+          while IFS= read -r app; do
+            [ -z "$app" ] && continue
+            case "$app" in '#'*) continue ;; esac
+            npm install -g "$app" || true
+          done < .vscode-state/npm.txt
+
+      - name: Install VS Code extensions
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /home/runner/.local/share/code-server/User
+          [ -f /home/runner/.local/share/code-server/User/settings.json ] \
+            || echo '{}' > /home/runner/.local/share/code-server/User/settings.json
+          installed="$(code-server --list-extensions 2>/dev/null || true)"
+          while IFS= read -r line; do
+            ext="$(echo "$line" | xargs)"
+            [ -z "$ext" ] && continue
+            case "$ext" in '#'*) continue ;; esac
+            id="${ext%%@*}"
+            if grep -qx "$id" <<< "$installed"; then
+              echo "  ✓ $id"
+            else
+              echo "  + $ext"
+              code-server --force --install-extension "$ext" || true
+            fi
+          done < .vscode-state/extensions.txt
+
+      # ------------------------------------------------------------------
+      # 11. Pro user config (always applied; cached version in the
+      #     snapshot is overwritten — but the user's own settings.json
+      #     edits inside the IDE are preserved by the cache slot when the
+      #     snapshot is re-restored, since the snapshot IS the home dir).
+      # ------------------------------------------------------------------
+      - name: Apply pro settings.json
+        run: |
+          mkdir -p /home/runner/.local/share/code-server/User
+          cat > /home/runner/.local/share/code-server/User/settings.json <<'JSON'
+          {
+            "workbench.colorTheme": "Catppuccin Mocha",
+            "workbench.iconTheme": "material-icon-theme",
+            "editor.fontFamily": "'Fira Code', 'JetBrains Mono', Consolas, monospace",
+            "editor.fontLigatures": true,
+            "editor.fontSize": 14,
+            "editor.tabSize": 2,
+            "editor.formatOnSave": true,
+            "editor.minimap.enabled": true,
+            "editor.cursorSmoothCaretAnimation": "on",
+            "editor.inlineSuggest.enabled": true,
+            "editor.linkedEditing": true,
+            "editor.copyWithSyntaxHighlighting": true,
+            "editor.codeActionsOnSave": {
+              "source.fixAll": "explicit",
+              "source.organizeImports": "explicit"
+            },
+            "files.trimTrailingWhitespace": true,
+            "files.insertFinalNewline": true,
+            "files.autoSave": "afterDelay",
+            "files.autoSaveDelay": 800,
+            "terminal.integrated.fontSize": 13,
+            "terminal.integrated.cursorStyle": "line",
+            "terminal.integrated.scrollback": 10000,
+            "telemetry.telemetryLevel": "off",
+            "update.mode": "none",
+            "git.autofetch": true,
+            "workbench.editor.enablePreview": false,
+            "window.restoreWindows": "all",
+            "extensions.supportUntrustedWorkspaces": {
+              "ms-python.python":    { "supported": true },
+              "ms-toolsai.jupyter":  { "supported": true }
+            }
+          }
+          JSON
+
+      - name: Apply pro keybindings + snippets
+        run: |
+          U=/home/runner/.local/share/code-server/User
+          cat > "$U/keybindings.json" <<'JSON'
+          [
+            { "key": "ctrl+`",         "command": "workbench.action.terminal.toggleTerminal" },
+            { "key": "ctrl+shift+`",   "command": "workbench.action.terminal.new" },
+            { "key": "ctrl+b",         "command": "workbench.action.toggleSidebarVisibility" },
+            { "key": "alt+up",         "command": "editor.action.moveLinesUpAction" },
+            { "key": "alt+down",       "command": "editor.action.moveLinesDownAction" },
+            { "key": "ctrl+shift+k",   "command": "editor.action.deleteLines" },
+            { "key": "ctrl+/",         "command": "editor.action.commentLine" },
+            { "key": "ctrl+shift+i",   "command": "editor.action.formatDocument" }
+          ]
+          JSON
+          mkdir -p "$U/snippets"
+          echo '{}' > "$U/snippets/markdown.json"
+
+      - name: Write code-server config
+        env:
+          INPUT_PASSWORD: ${{ inputs.password }}
+        run: |
+          set -euo pipefail
+          mkdir -p /home/runner/.config/code-server
+          AUTH=none
+          PW_LINE=""
+          if [ -n "$INPUT_PASSWORD" ]; then
+            HASHED="$(code-server --hash-password "$INPUT_PASSWORD" 2>/dev/null || true)"
+            if [ -n "$HASHED" ]; then
+              AUTH=password
+              PW_LINE="  password: $HASHED"
+            fi
+          fi
+          {
+            echo "bind-addr: 0.0.0.0:${{ env.CODE_SERVER_PORT }}"
+            echo "auth: $AUTH"
+            [ -n "$PW_LINE" ] && echo "$PW_LINE"
+            echo "cert: false"
+            echo "disable-telemetry: true"
+            echo "disable-update-check: true"
+          } > /home/runner/.config/code-server/config.yaml
+
+      - name: Seed user files (only if missing)
+        run: |
+          [ -f /home/runner/.gitconfig ] || cat > /home/runner/.gitconfig <<'EOF'
+          [user]
+            name  = VS Code User
+            email = vscode@users.noreply.github.com
+          [init]
+            defaultBranch = main
+          [pull]
+            rebase = true
+          [core]
+            autocrlf = input
+            fileMode = false
+          EOF
+          [ -f /home/runner/.npmrc ] || cat > /home/runner/.npmrc <<'EOF'
+          save-exact=true
+          fund=false
+          audit=false
+          update-notifier=false
+          EOF
+
+      # ------------------------------------------------------------------
+      # 12. Write sentinel AFTER installs succeed.
+      # ------------------------------------------------------------------
+      - name: Write install sentinel
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          mkdir -p /home/runner/.vscode-state
+          echo -n "${{ steps.hash.outputs.manifest }}" > /home/runner/.vscode-state/sentinel
+
+      # ------------------------------------------------------------------
+      # 13. Start code-server.
+      # ------------------------------------------------------------------
+      - name: Start code-server
+        run: |
+          set -euo pipefail
+          nohup code-server \
+            --config /home/runner/.config/code-server/config.yaml \
+            --user-data-dir /home/runner/.local/share/code-server \
+            "$GITHUB_WORKSPACE" \
+            > /tmp/code-server.log 2>&1 &
+          echo $! > /tmp/code-server.pid
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:${{ env.CODE_SERVER_PORT }}/healthz" 2>/dev/null \
+               || curl -fsS -o /dev/null "http://127.0.0.1:${{ env.CODE_SERVER_PORT }}" 2>/dev/null; then
+              echo "code-server up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::code-server didn't start in 60s"
+          tail -n 80 /tmp/code-server.log
+          exit 1
+
+      # ------------------------------------------------------------------
+      # 14. trycloudflare tunnel, capture URL.
+      # ------------------------------------------------------------------
+      - name: Start trycloudflare tunnel
+        id: tunnel
+        run: |
+          set -euo pipefail
+          rm -f /tmp/cf.log
+          nohup cloudflared tunnel --no-autoupdate \
+            --url "http://127.0.0.1:${{ env.CODE_SERVER_PORT }}" \
+            > /tmp/cf.log 2>&1 &
+          echo $! > /tmp/cf.pid
+          URL=""
+          for i in $(seq 1 90); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n1 || true)
+            [ -n "$URL" ] && { echo "url=$URL" >> "$GITHUB_OUTPUT"; break; }
+            sleep 1
+          done
+          [ -n "$URL" ] || { echo "::error::no trycloudflare URL in 90s"; tail -n 80 /tmp/cf.log; exit 1; }
+
+      # ------------------------------------------------------------------
+      # 15. Surface the URL.
+      # ------------------------------------------------------------------
+      - name: Print VS Code URL
+        run: |
+          URL="${{ steps.tunnel.outputs.url }}"
+          {
+            echo "## 🟢 VS Code is live"; echo
+            echo "**URL:** \`$URL\`"; echo
+            echo "- Duration: **${{ inputs.duration }} min**"
+            echo "- Your home dir will be snapshotted to a GitHub Release on exit"
+            if [ -n "${{ inputs.password }}" ]; then
+              echo "- 🔐 Password is set"
+            else
+              echo "- ⚠️ No auth — anyone with the URL can connect"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo
+          echo "================================================================="
+          echo "  VS Code URL:  $URL"
+          echo "  Duration:     ${{ inputs.duration }} minutes"
+          echo "================================================================="
+
+      # ------------------------------------------------------------------
+      # 16. Heartbeat loop.
+      # ------------------------------------------------------------------
+      - name: Keep session alive
+        env:
+          END_EPOCH: ${{ fromJSON(inputs.duration) }}
+        run: |
+          TARGET=$(( $(date +%s) + END_EPOCH * 60 ))
+          while [ "$(date +%s)" -lt "$TARGET" ]; do
+            REMAIN=$(( (TARGET - $(date +%s)) / 60 ))
+            if [ -d /proc/$(cat /tmp/code-server.pid) ] && [ -d /proc/$(cat /tmp/cf.pid) ]; then
+              echo "::notice::${REMAIN} min remaining"
+            else
+              echo "::warning::a background process died"
+              tail -n 30 /tmp/code-server.log /tmp/cf.log || true
+            fi
+            sleep 30
+          done
+
+      # ------------------------------------------------------------------
+      # 17. Graceful stop.
+      # ------------------------------------------------------------------
+      - name: Stop services
+        if: always()
+        run: |
+          set +e
+          for p in /tmp/cf.pid /tmp/code-server.pid; do
+            [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null
+          done
+          sleep 2
+          for p in /tmp/cf.pid /tmp/code-server.pid; do
+            [ -f "$p" ] && kill -9 "$(cat "$p")" 2>/dev/null
+          done
+
+      # ------------------------------------------------------------------
+      # 18. SAVE: tar + zstd the whole /home/runner, split into 1900 MB
+      #     chunks, upload as a versioned GitHub Release.
+      # ------------------------------------------------------------------
+      - name: Build home snapshot archive
+        if: "!cancelled()"
+        run: |
+          set -euo pipefail
+          cd /home/runner
+
+          # Tar + zstd the entire home. --no-same-owner so the archive
+          # can be extracted on any runner without UID issues.
+          # -T0 uses all cores; -3 is a good speed/ratio balance.
+          tar --no-same-owner --use-compress-program='zstd -T0 -3' \
+              -cf /tmp/home.tar.zst .
+          echo "archive size: $(du -h /tmp/home.tar.zst | cut -f1)"
+
+          # Split into ~1900 MB chunks (safe under the 2 GB release cap).
+          rm -f /tmp/home.part.*
+          split -b 1900M -d -a 3 /tmp/home.tar.zst /tmp/home.part.
+          echo "chunk count: $(ls /tmp/home.part.* | wc -l)"
+          ls -lh /tmp/home.part.*
+          rm -f /tmp/home.tar.zst
+
+      - name: Upload snapshot to GitHub Release
+        if: "!cancelled()"
+        run: |
+          set -euo pipefail
+          TAG="vscode-snapshot/${{ github.run_id }}-$(date -u +%Y%m%d-%H%M%S)"
+
+          # Garbage-collect old snapshots if we're not keeping history.
+          # To keep the last N snapshots, change the condition to skip
+          # the delete when there are < N existing releases.
+          if [ "${{ inputs.keep_history }}" = "0" ]; then
+            OLD_TAGS=$(gh release list --repo "$GH_REPO" --limit 100 \
+                       --json tagName \
+                       -q '.[] | select(.tagName | startswith("vscode-snapshot/")) | .tagName' \
+                       || true)
+            for OLD in $OLD_TAGS; do
+              [ "$OLD" = "$TAG" ] && continue
+              echo "Deleting previous snapshot $OLD"
+              gh release delete "$OLD" --repo "$GH_REPO" --yes --cleanup-tags || true
+            done
+          fi
+
+          echo "Creating release $TAG"
+          gh release create "$TAG" \
+            --repo "$GH_REPO" \
+            --title "VS Code home snapshot" \
+            --notes "Run ${{ github.run_id }} · ${{ github.event.head_commit.message }}" \
+            --target "${{ github.sha }}" \
+            /tmp/home.part.*
+
+          # Summary for the run page
+          {
+            echo "## 📦 Snapshot uploaded"
+            echo
+            echo "**Release:** $TAG"
+            echo
+            gh release view "$TAG" --repo "$GH_REPO" --json assets \
+              -q '.assets[] | "- `\(.name)` (\(.size/1024/1024|floor) MB)"' \
+              | tee -a "$GITHUB_STEP_SUMMARY" >/dev/null
+            # Fallback if gh output is empty
+            [ -s /tmp/release-info ] || cat /tmp/release-info >> "$GITHUB_STEP_SUMMARY" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rm -f /tmp/home.part.*
+          echo "Snapshot upload complete: $TAG"
