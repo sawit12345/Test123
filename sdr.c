@@ -1,7 +1,10 @@
 /* sdr.c - sparse distributed representations in one C file.
  *
- * Build: cc -std=c99 -O2 -Wall -Wextra sdr.c -o sdr_demo -lm
+ * Build: cc -std=c17 -O2 -Wall -Wextra sdr.c -o sdr_demo -lm
  * Test:  ./sdr_demo (exit 0 = all checks pass)
+ * UBSan: cc -std=c17 -O1 -g -fsanitize=undefined sdr.c -o sdr_ubsan -lm && ./sdr_ubsan
+ * Strict ISO C (no GNU __int128): cc -std=c17 -O2 -Wall -Wextra -Wpedantic -DSDR_NO_INT128 sdr.c -o sdr_demo -lm
+ * Note: default __int128 path is a GNU extension and warns under -Wpedantic; use SDR_NO_INT128 for pedantic builds.
  * Define SDR_NO_MAIN to use as a library without the demo main.
  *
  * Ownership: sdr_t is caller-owned. sdr_init allocates bits, sdr_dispose
@@ -64,7 +67,7 @@ static uint64_t sdr_tail_mask(const sdr_t *r)
     unsigned b = (unsigned)r->n & 63u;
     if (b == 0)
         return ~0ull;
-    return (1ull << b) - 1u;
+    return (1ull << b) - 1ull;
 }
 
 int sdr_init(sdr_t *r, int n)
@@ -163,6 +166,52 @@ int sdr_overlap(const sdr_t *a, const sdr_t *b)
     return c;
 }
 
+int sdr_equal(const sdr_t *a, const sdr_t *b)
+{
+    int i;
+    if (!sdr_valid(a) || !sdr_valid(b) || a->n != b->n)
+        return 0;
+    for (i = 0; i < a->words; i++) {
+        if (a->bits[i] != b->bits[i])
+            return 0;
+    }
+    return 1;
+}
+
+int sdr_union_count(const sdr_t *a, const sdr_t *b)
+{
+    int i, c = 0;
+    if (!sdr_valid(a) || !sdr_valid(b) || a->n != b->n)
+        return -1;
+    for (i = 0; i < a->words; i++) {
+#if defined(__GNUC__) || defined(__clang__)
+        c += __builtin_popcountll(a->bits[i] | b->bits[i]);
+#else
+        uint64_t x = a->bits[i] | b->bits[i];
+        for (; x; x &= x - 1)
+            c++;
+#endif
+    }
+    return c;
+}
+
+int sdr_hamming(const sdr_t *a, const sdr_t *b)
+{
+    int i, c = 0;
+    if (!sdr_valid(a) || !sdr_valid(b) || a->n != b->n)
+        return -1;
+    for (i = 0; i < a->words; i++) {
+#if defined(__GNUC__) || defined(__clang__)
+        c += __builtin_popcountll(a->bits[i] ^ b->bits[i]);
+#else
+        uint64_t x = a->bits[i] ^ b->bits[i];
+        for (; x; x &= x - 1)
+            c++;
+#endif
+    }
+    return c;
+}
+
 int sdr_match(const sdr_t *a, const sdr_t *b, int theta)
 {
     int ov;
@@ -250,14 +299,15 @@ static uint32_t sdr_rng_below(sdr_rng_t *rng, uint32_t bound)
     }
 #else
     {
-        uint64_t t = (uint64_t)(~(uint32_t)0 % bound) + 1u;
-    for (;;) {
-        uint32_t r = (uint32_t)(sdr_rng_next(rng) >> 32);
-        uint64_t m = (uint64_t)r * bound;
-        uint32_t low = (uint32_t)m;
-        if (low >= t || (uint64_t)(r - low) <= (uint64_t)0xffffffffu - t)
-            return (uint32_t)(m >> 32);
-    }
+        /* Canonical 32-bit Lemire: t is the rejection threshold.
+         * 0u - bound wraps to 2^32 - bound, so t = (-bound) % bound. */
+        uint32_t t = (uint32_t)(0u - bound) % bound;
+        for (;;) {
+            uint32_t r = (uint32_t)(sdr_rng_next(rng) >> 32);
+            uint64_t m = (uint64_t)r * bound;
+            if ((uint32_t)m >= t)
+                return (uint32_t)(m >> 32);
+        }
     }
 #endif
 }
@@ -301,10 +351,29 @@ int sdr_random(sdr_t *r, sdr_rng_t *rng, int w)
 static int sdr_active_list(const sdr_t *r, int *out, int cap)
 {
     int n = 0;
-    int i;
-    for (i = 0; i < r->n && n < cap; i++) {
-        if ((r->bits[(size_t)i >> 6] >> (((unsigned)i) & 63u)) & 1u)
-            out[n++] = i;
+    int wi;
+    if (!r || !out || cap <= 0)
+        return 0;
+    for (wi = 0; wi < r->words && n < cap; wi++) {
+        uint64_t w = r->bits[wi];
+        while (w) {
+#if defined(__GNUC__) || defined(__clang__)
+            unsigned b = (unsigned)__builtin_ctzll(w);
+#else
+            unsigned b = 0;
+            while (b < 64 && ((w >> b) & 1ull) == 0)
+                b++;
+            if (b >= 64)
+                break;
+#endif
+            int bit = wi * 64 + (int)b;
+            if (bit >= r->n)
+                break;
+            out[n++] = bit;
+            if (n >= cap)
+                break;
+            w &= w - 1;
+        }
     }
     return n;
 }
@@ -335,7 +404,7 @@ int sdr_subsample(sdr_t *dst, const sdr_t *src, sdr_rng_t *rng, int w)
 
 int sdr_add_noise(sdr_t *dst, const sdr_t *src, sdr_rng_t *rng, double frac)
 {
-    int have, nflip, i, j, k, n;
+    int have, nflip, i, j, k, n, wi;
     int *on = NULL, *off = NULL;
     int non = 0, noff = 0;
     if (!sdr_valid(dst) || !sdr_valid(src) || dst->n != src->n || !rng)
@@ -360,11 +429,43 @@ int sdr_add_noise(sdr_t *dst, const sdr_t *src, sdr_rng_t *rng, double frac)
         SDR_FREE(off);
         return SDR_ERR_NOMEM;
     }
-    for (i = 0; i < n; i++) {
-        if ((src->bits[(size_t)i >> 6] >> (((unsigned)i) & 63u)) & 1u)
-            on[non++] = i;
-        else
-            off[noff++] = i;
+    for (wi = 0; wi < src->words; wi++) {
+        uint64_t w = src->bits[wi];
+        uint64_t inv = ~w;
+        int base = wi * 64;
+        int bend = base + 64 <= n ? 64 : n - base;
+        if (wi == src->words - 1)
+            inv &= sdr_tail_mask(src);
+        while (w) {
+#if defined(__GNUC__) || defined(__clang__)
+            unsigned b = (unsigned)__builtin_ctzll(w);
+#else
+            unsigned b = 0;
+            while (b < 64 && ((w >> b) & 1ull) == 0)
+                b++;
+            if (b >= 64)
+                break;
+#endif
+            if ((int)b >= bend)
+                break;
+            on[non++] = base + (int)b;
+            w &= w - 1;
+        }
+        while (inv) {
+#if defined(__GNUC__) || defined(__clang__)
+            unsigned b = (unsigned)__builtin_ctzll(inv);
+#else
+            unsigned b = 0;
+            while (b < 64 && ((inv >> b) & 1ull) == 0)
+                b++;
+            if (b >= 64)
+                break;
+#endif
+            if ((int)b >= bend)
+                break;
+            off[noff++] = base + (int)b;
+            inv &= inv - 1;
+        }
     }
     for (i = non - 1; i > 0; i--) {
         j = (int)sdr_rng_below(rng, (uint32_t)(i + 1));
@@ -452,6 +553,8 @@ int sdr_rdse_init(sdr_rdse_t *e, int n, int w, double resolution,
         return SDR_ERR_INVAL;
     if (n <= 6 * w || (w & 1) == 0)
         return SDR_ERR_RANGE;
+    if (w > 256)
+        return SDR_ERR_RANGE; /* build uses fixed 256 stack buffers */
     if (max_buckets <= 0)
         max_buckets = 1000;
     if (max_buckets > 65536)
@@ -459,8 +562,12 @@ int sdr_rdse_init(sdr_rdse_t *e, int n, int w, double resolution,
     e->sets = (int *)SDR_MALLOC((size_t)max_buckets * (size_t)w * sizeof *e->sets);
     if (!e->sets)
         return SDR_ERR_NOMEM;
-    for (int i = 0; i < max_buckets * w; i++)
-        e->sets[i] = -1;
+    {
+        size_t total = (size_t)max_buckets * (size_t)w;
+        size_t k;
+        for (k = 0; k < total; k++)
+            e->sets[k] = -1;
+    }
     e->n = n;
     e->w = w;
     e->nbuckets = 0;
@@ -472,21 +579,40 @@ int sdr_rdse_init(sdr_rdse_t *e, int n, int w, double resolution,
 
 void sdr_rdse_free(sdr_rdse_t *e)
 {
-    if (e && e->sets) {
+    if (e) {
         SDR_FREE(e->sets);
         e->sets = NULL;
-    }
-    if (e) {
-        e->nbuckets = 0;
+        e->n = 0;
+        e->w = 0;
         e->max_buckets = 0;
+        e->resolution = 0;
+        e->offset = 0;
     }
 }
 
 long sdr_rdse_bucket(const sdr_rdse_t *e, double x)
 {
+    double q;
+    long long r, base, idx;
     if (!e || !(x == x))
         return 0;
-    return (long)(e->max_buckets / 2) + (long)llround((x - e->offset) / e->resolution);
+    if (!(e->resolution > 0.0) || !(e->resolution == e->resolution))
+        return (long)(e->max_buckets / 2);
+    q = (x - e->offset) / e->resolution;
+    if (!(q == q))
+        return (long)(e->max_buckets / 2);
+    /* Saturate huge or non-finite quotients to out-of-range sentinels
+     * that callers already treat as SDR_ERR_RANGE. */
+    if (!(q > -9.0e18 && q < 9.0e18))
+        return q > 0 ? (long)e->max_buckets : (long)-1;
+    r = llround(q);
+    base = (long long)(e->max_buckets / 2);
+    idx = base + r;
+    if (idx < 0)
+        return (long)-1;
+    if (idx >= e->max_buckets)
+        return (long)e->max_buckets;
+    return (long)idx;
 }
 
 static int sdr_set_overlap(const int *a, const int *b, int w)
@@ -517,8 +643,20 @@ static int sdr_in_set(const int *s, int w, int bit)
 /* True NuPIC rule: overlap falls linearly inside the w-window. */
 static int sdr_rdse_ok(const sdr_rdse_t *e, int idx, const int *cand)
 {
-    int b;
-    for (b = 0; b < e->max_buckets; b++) {
+    int b, lo, hi, limit;
+    /* Far buckets are skipped by the dist rule below, so only scan the
+     * local window. Semantics are identical, cost drops from O(max_buckets)
+     * to O(w) per check. */
+    limit = e->w * 4;
+    if (limit < 65)
+        limit = 65;
+    lo = idx - limit;
+    hi = idx + limit;
+    if (lo < 0)
+        lo = 0;
+    if (hi >= e->max_buckets)
+        hi = e->max_buckets - 1;
+    for (b = lo; b <= hi; b++) {
         const int *old = &e->sets[(size_t)b * (size_t)e->w];
         int dist, ov;
         if (old[0] < 0 || b == idx)
@@ -864,6 +1002,40 @@ int sdr_selftest(void)
     sdr_rdse_free(&e);
     SDR_T(sdr_rdse_init(&e, 100, 20, 0.1, 0.0, 0) == SDR_ERR_RANGE);
     SDR_T(sdr_rdse_init(&e, 400, 21, -1.0, 0.0, 0) == SDR_ERR_INVAL);
+
+    SDR_T(sdr_init(&a, 128) == SDR_OK);
+    SDR_T(sdr_init(&b, 128) == SDR_OK);
+    sdr_rng_seed(&rng, 99);
+    SDR_T(sdr_random(&a, &rng, 12) == SDR_OK);
+    SDR_T(sdr_copy(&b, &a) == SDR_OK);
+    SDR_T(sdr_equal(&a, &b) == 1);
+    SDR_T(sdr_union_count(&a, &b) == 12 && sdr_hamming(&a, &b) == 0);
+    SDR_T(sdr_random(&b, &rng, 12) == SDR_OK);
+    {
+        int ca = sdr_count(&a), cb = sdr_count(&b);
+        int o = sdr_overlap(&a, &b);
+        int u = sdr_union_count(&a, &b);
+        int h = sdr_hamming(&a, &b);
+        SDR_T(o >= 0 && u == ca + cb - o && h == ca + cb - 2 * o);
+        SDR_T(sdr_equal(&a, &b) == (h == 0));
+    }
+    sdr_dispose(&a);
+    sdr_dispose(&b);
+
+    SDR_T(sdr_init(&a, 100) == SDR_OK);
+    sdr_rng_seed(&rng, 7);
+    SDR_T(sdr_random(&a, &rng, 10) == SDR_OK);
+    SDR_T((a.bits[a.words - 1] & ~sdr_tail_mask(&a)) == 0);
+    sdr_dispose(&a);
+
+    SDR_T(sdr_rdse_init(&e, 400, 21, 0.1, 0.0, 512) == SDR_OK);
+    SDR_T(sdr_rdse_bucket(&e, 1e30) == (long)e.max_buckets);
+    SDR_T(sdr_rdse_bucket(&e, -1e30) == (long)-1);
+    SDR_T(sdr_init(&a, 400) == SDR_OK);
+    SDR_T(sdr_rdse_encode(&a, &e, &rng, 1e30) == SDR_ERR_RANGE);
+    sdr_dispose(&a);
+    sdr_rdse_free(&e);
+    SDR_T(e.sets == NULL && e.n == 0 && e.w == 0 && e.max_buckets == 0);
 
     if (fails == 0)
         printf("sdr selftest: all pass\n");
